@@ -1,5 +1,5 @@
 A open-source Pwntools Extern Functions.
-You only should type like this:
+Usage:
 ```
 from PwnModules import *
 ```
