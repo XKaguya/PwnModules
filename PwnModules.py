@@ -8,14 +8,14 @@ Pwntools-Extern Functions
 from LibcSearcher import *
 from pwn import *
 
-__version__ = '1.0'
+__version__ = '1.1'
 
 def leak_addr(i, io_i):
+    if i == 0:
+        address_internal = u32(io_i.recv(4))
+        return address_internal
     if i == 1:
         address_internal = u64(io_i.recvuntil(b'\x7f')[:6].ljust(8, b'\x00'))
-        return address_internal
-    else:
-        address_internal = u32(io_i.recv(4))
         return address_internal
     if i == 2:
         address_internal = u64(io_i.recvuntil(b'\x7f')[-6:].ljust(8, b'\x00'))
