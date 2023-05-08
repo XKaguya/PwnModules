@@ -8,7 +8,7 @@ Pwntools-Extern Functions
 from LibcSearcher import *
 from pwn import *
 
-__version__ = '1.1'
+__version__ = '1.2'
 
 def leak_addr(i, io_i):
     if i == 0:
@@ -63,5 +63,5 @@ def debug(io):
     pause()
 
 
-def get_int_addr(io):
-    return int(io.recv(12), 16)
+def get_int_addr(io, num):
+    return int(io.recv(num), 16)
