@@ -8,7 +8,7 @@ Pwntools-Extern Functions
 from LibcSearcher import *
 from pwn import *
 
-__version__ = '1.3'
+__version__ = '1.4'
 
 def leak_addr(i, io_i):
 	if i == 0:
@@ -44,16 +44,32 @@ def get_int_addr(io, num):
 	return int(io.recv(num), 16)
 
 def show_addr(msg, *args, **kwargs):
-    msg = f'\x1b[01;38;5;90m{msg}\x1b[0m'
-    colored_text = '\x1b[01;38;5;90m' + ': ' + '\x1b[0m'
+	msg = f'\x1b[01;38;5;90m{msg}\x1b[0m'
+	colored_text = '\x1b[01;38;5;90m' + ': ' + '\x1b[0m'
 
-    for arg in args:
-        hex_text = hex(arg)
-        colored_hex_text = f'\x1b[01;38;5;90m{hex_text}\x1b[0m'
-        print(f"{msg}{colored_text}{colored_hex_text}")
+	for arg in args:
+		hex_text = hex(arg)
+		colored_hex_text = f'\x1b[01;38;5;90m{hex_text}\x1b[0m'
+		print(f"{msg}{colored_text}{colored_hex_text}")
 
-    for key, value in kwargs.items():
-        hex_text = hex(value)
-        colored_hex_text = f'\x1b[01;38;5;90m{hex_text}\x1b[0m'
-        print(f"{msg}{colored_text}{key}{colored_hex_text}")
+	for key, value in kwargs.items():
+		hex_text = hex(value)
+		colored_hex_text = f'\x1b[01;38;5;90m{hex_text}\x1b[0m'
+		print(f"{msg}{colored_text}{key}{colored_hex_text}")
 
+def init_env(arch, loglevel='info'):
+	if (arch == 'amd64'):
+		context(arch='amd64', os='linux', log_level=loglevel)
+	else:
+		context(arch='x86', os='linux', log_level=loglevel)
+		
+def get_utils(binary, local=True, ip=None, port=None):
+	elf = ELF(binary)
+	
+	if not local:
+		io = remote(ip, port)
+		return io, elf
+		
+	else:
+		io = process(binary)
+		return io, elf
