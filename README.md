@@ -1,4 +1,4 @@
-An open-source Pwntools Extern Functions.
+An open-source Pwntools Extern functions module.
 
 Usage:
 ```
