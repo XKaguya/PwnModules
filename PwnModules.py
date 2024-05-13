@@ -7,9 +7,11 @@ Pwntools-Extern Functions
 
 from LibcSearcher import *
 from pwn import *
+from typing import Optional, Tuple
 import re
 
-__version__ = '1.5'
+__version__ = '1.7'
+
 
 def leak_addr(i, io_i):
     """
@@ -22,17 +24,15 @@ def leak_addr(i, io_i):
     Returns:
         int: 返回获取到的内存地址。
     """
-    if i == 0:
-        address_internal = u32(io_i.recv(4))
-        return address_internal
-    if i == 1:
-        address_internal = u64(io_i.recvuntil(b'\x7f')[:6].ljust(8, b'\x00'))
-        return address_internal
-    if i == 2:
-        address_internal = u64(io_i.recvuntil(b'\x7f')[-6:].ljust(8, b'\x00'))
-        return address_internal
+    address_methods = {
+        0: lambda: u32(io_i.recv(4)),
+        1: lambda: u64(io_i.recvuntil(b'\x7f')[:6].ljust(8, b'\x00')),
+        2: lambda: u64(io_i.recvuntil(b'\x7f')[-6:].ljust(8, b'\x00'))
+    }
 
-def libc_remastered(func, addr_i, onlineMode=False):
+    return address_methods[i]()
+
+def libc_search(func, addr_i, onlineMode=False):
     """
     在没有提供Libc版本时，这个参数可以快捷的使用LibcSearcher获取常用函数地址。
 
@@ -46,18 +46,20 @@ def libc_remastered(func, addr_i, onlineMode=False):
     """
     libc_i = LibcSearcher(func, addr_i, online=onlineMode)
     libc_base_i = addr_i - libc_i.dump(func)
-    sys_i = libc_base_i + libc_i.dump('system')
-    sh_i = libc_base_i + libc_i.dump('str_bin_sh')
-    return libc_base_i, sys_i, sh_i
+    return libc_base_i, libc_base_i + libc_i.dump('system'), libc_base_i + libc_i.dump('str_bin_sh')
 
-def debug(io):
+def debug(io, breakpoint=None):
     """
     快捷GDB Attach函数。
 
     Args:
         io: IO流
+        breakpoint: 断点地址
     """
-    gdb.attach(io)
+    if breakpoint is not None:
+        gdb.attach(io, gdbscript='b *{}'.format(breakpoint))
+    else:
+        gdb.attach(io)
     pause()
 
 def recv_int_addr(io, num):
@@ -67,12 +69,21 @@ def recv_int_addr(io, num):
     Args:
         io: IO流
         num: 需要接收几位数字
+        format: 数字的进制，默认为十进制
 
     Returns:
         int: Int地址的十进制格式。
     """
-    return int(io.recv(num), 16)
-
+    
+    try:
+        received = io.recv(num)
+        return int(received,)
+    except ValueError:
+        if received.startswith(b'0x'):
+            return int(received, 16)
+        else:
+            raise
+    
 def show_addr(msg, *args, **kwargs):
     """
     打印地址。
@@ -95,20 +106,20 @@ def show_addr(msg, *args, **kwargs):
         colored_hex_text = f'\x1b[01;38;5;90m{hex_text}\x1b[0m'
         print(f"{msg}{colored_text}{key}{colored_hex_text}")
 
-def init_env(arch, loglevel='info'):
+def init_env(arch=1, loglevel='debug'):
     """
-    初始化环境，默认为 amd64 架构，info 级日志打印。
+    初始化环境，默认为 amd64, debuf 级日志打印。
 
     Args:
-        arch: 系统架构
+        arch: 系统架构，1表示64位，0表示32位
         log_level: 日志打印等级
     """
-    if (arch == 'amd64'):
+    if (arch == 1):
         context(arch='amd64', os='linux', log_level=loglevel)
     else:
         context(arch='i386', os='linux', log_level=loglevel)
 
-def get_utils(binary=None, local=True, ip=None, port=None):
+def get_utils(binary: Optional[str] = None, local: bool = True, ip: Optional[str] = None, port: Optional[int] = None) -> Tuple[Optional[tube], Optional[ELF]]:
     """
     快速获取IO流和ELF。
 
@@ -122,19 +133,14 @@ def get_utils(binary=None, local=True, ip=None, port=None):
         io: IO流
         elf: ELF引用
     """
-    if binary is not None:
-        elf = ELF(binary)
-    elf = None
+    elf = ELF(binary) if binary is not None else None
 
     if not local:
         io = remote(ip, port)
-        return io, elf
-
     else:
-        if binary is not None:
-            io = process(binary)
-            return io, elf
-        return None, elf
+        io = process(binary) if binary is not None else None
+
+    return io, elf
 
 def fmt_canary(binary=None):
     """
